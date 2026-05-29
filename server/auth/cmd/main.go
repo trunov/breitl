@@ -6,18 +6,30 @@ import (
 	"net"
 
 	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/trunov/goph-keeper/server/auth/internal/config"
-	"github.com/trunov/goph-keeper/server/auth/internal/lib/jwt"
-	"github.com/trunov/goph-keeper/server/auth/internal/storage/postgres"
-	pb "github.com/trunov/goph-keeper/server/auth/proto"
+	"github.com/trunov/breitl/backend/server/auth/internal/config"
+	"github.com/trunov/breitl/backend/server/auth/internal/lib/jwt"
+	"github.com/trunov/breitl/backend/server/auth/internal/storage/postgres"
+	pb "github.com/trunov/breitl/backend/server/auth/proto"
 	"google.golang.org/grpc"
 )
 
 func main() {
 	cfg := config.ReadConfig()
 
-	if cfg.Secret == "" || cfg.PostgresDSN == "" {
-		log.Fatal("Secret or PostgresDSN should be provided")
+	if cfg.PostgresDSN == "" {
+		log.Fatal("PostgresDSN should be provided")
+	}
+
+	if cfg.JWTPrivateKeyPath == "" {
+		log.Fatal("JWTPrivateKeyPath should be provided")
+	}
+
+	if cfg.JWTPublicKeyPath == "" {
+		log.Fatal("JWTPublicKeyPath should be provided")
+	}
+
+	if cfg.JWTIssuer == "" {
+		log.Fatal("JWTIssuer should be provided")
 	}
 
 	ctx := context.Background()
@@ -34,8 +46,22 @@ func main() {
 		log.Fatal(err)
 	}
 
+	privateKey, err := jwt.LoadEd25519PrivateKey(cfg.JWTPrivateKeyPath)
+	if err != nil {
+		log.Fatalf("failed to load JWT private key: %v", err)
+	}
+
+	publicKey, err := jwt.LoadEd25519PublicKey(cfg.JWTPublicKeyPath)
+	if err != nil {
+		log.Fatalf("failed to load JWT public key: %v", err)
+	}
+
 	storage := postgres.NewDBStorage(dbpool)
-	jwtService := jwt.NewJWTService(cfg.Secret)
+	jwtService := jwt.NewJWTService(
+		privateKey,
+		publicKey,
+		cfg.JWTIssuer,
+	)
 
 	authServer := NewAuthServer(storage, jwtService)
 

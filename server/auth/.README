@@ -1,0 +1,4 @@
+POSTGRES_DSN=postgres://user:password@localhost:5432/auth?sslmode=disable
+JWT_PRIVATE_KEY_PATH=./secrets/ed25519_private.pem
+JWT_PUBLIC_KEY_PATH=./secrets/ed25519_public.pem
+JWT_ISSUER=goph-keeper-auth

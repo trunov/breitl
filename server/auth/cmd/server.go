@@ -7,19 +7,34 @@ import (
 	"strings"
 	"time"
 
-	j "github.com/golang-jwt/jwt/v5"
-	"github.com/trunov/goph-keeper/server/auth/internal/domain/models"
-	"github.com/trunov/goph-keeper/server/auth/internal/lib/jwt"
-	"github.com/trunov/goph-keeper/server/auth/internal/storage/postgres"
-	pb "github.com/trunov/goph-keeper/server/auth/proto"
+	"github.com/trunov/breitl/backend/server/auth/internal/domain/models"
+	"github.com/trunov/breitl/backend/server/auth/internal/lib/jwt"
+	"github.com/trunov/breitl/backend/server/auth/internal/storage/postgres"
+	pb "github.com/trunov/breitl/backend/server/auth/proto"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+const (
+	accessTokenTTL  = time.Hour * 2
+	defaultAudience = "erp-api"
+)
+
 type Storager interface {
-	RegisterUser(ctx context.Context, email, password string) (userID int64, err error)
-	FindUser(ctx context.Context, email string) (user models.User, err error)
+	RegisterAccountWithOwner(
+		ctx context.Context,
+		companyName string,
+		ownerFullName string,
+		email string,
+		passwordHash string,
+	) (account models.Account, user models.User, err error)
+
+	FindUserByAccountAndEmail(
+		ctx context.Context,
+		accountID string,
+		email string,
+	) (user models.User, err error)
 }
 
 type AuthServer struct {
@@ -29,63 +44,145 @@ type AuthServer struct {
 }
 
 func NewAuthServer(storage Storager, jwtService jwt.JWTService) *AuthServer {
-	return &AuthServer{storage: storage, jwtService: jwtService}
+	return &AuthServer{
+		storage:    storage,
+		jwtService: jwtService,
+	}
 }
 
 func (s *AuthServer) Register(ctx context.Context, in *pb.RegisterRequest) (*pb.RegisterResponse, error) {
+	companyName := strings.TrimSpace(in.CompanyName)
+	fullName := strings.TrimSpace(in.FullName)
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+
+	if companyName == "" {
+		return nil, status.Error(codes.InvalidArgument, "company name is required")
+	}
+
+	if fullName == "" {
+		return nil, status.Error(codes.InvalidArgument, "full name is required")
+	}
+
+	if email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email is required")
+	}
+
+	if len(in.Password) < 8 {
+		return nil, status.Error(codes.InvalidArgument, "password must be at least 8 characters")
+	}
+
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, err
+		log.Printf("failed to hash password: %v", err)
+		return nil, status.Error(codes.Internal, "internal error")
 	}
 
-	userID, err := s.storage.RegisterUser(ctx, in.Email, string(hashedPassword))
+	account, user, err := s.storage.RegisterAccountWithOwner(
+		ctx,
+		companyName,
+		fullName,
+		email,
+		string(hashedPassword),
+	)
 	if err != nil {
-		if strings.Contains(err.Error(), "unique constraint violation") {
-			return nil, status.Errorf(codes.AlreadyExists, "user with email %s already exists", in.Email)
+		if errors.Is(err, postgres.ErrDuplicateUserEmail) {
+			return nil, status.Errorf(codes.AlreadyExists, "user with email %s already exists in this account", email)
 		}
-		return nil, status.Errorf(codes.Internal, "error registering user: %v", err)
+
+		log.Printf("error registering account owner: %v", err)
+		return nil, status.Error(codes.Internal, "internal error")
 	}
 
-	return &pb.RegisterResponse{UserID: userID}, nil
+	token, expiresAt, err := s.jwtService.NewAccessToken(
+		user,
+		accessTokenTTL,
+		[]string{defaultAudience},
+	)
+	if err != nil {
+		log.Printf("failed to create access token: %v", err)
+		return nil, status.Error(codes.Internal, "internal error")
+	}
+
+	return &pb.RegisterResponse{
+		AccountId: account.ID,
+		UserId:    user.ID,
+		Token:     token,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
+	}, nil
 }
 
 func (s *AuthServer) Login(ctx context.Context, in *pb.LoginRequest) (*pb.LoginResponse, error) {
-	user, err := s.storage.FindUser(ctx, in.Email)
+	accountID := strings.ToUpper(strings.TrimSpace(in.AccountId))
+	email := strings.ToLower(strings.TrimSpace(in.Email))
+
+	if accountID == "" {
+		return nil, status.Error(codes.InvalidArgument, "account id is required")
+	}
+
+	if email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email is required")
+	}
+
+	if in.Password == "" {
+		return nil, status.Error(codes.InvalidArgument, "password is required")
+	}
+
+	user, err := s.storage.FindUserByAccountAndEmail(ctx, accountID, email)
 	if err != nil {
 		if errors.Is(err, postgres.ErrUserNotFound) {
-			return nil, status.Error(codes.PermissionDenied, "email or password is incorrect")
+			return nil, status.Error(codes.PermissionDenied, "account id, email or password is incorrect")
 		}
 
-		log.Printf("internal error ocurred while finding user: %v", err)
+		log.Printf("internal error occurred while finding user: %v", err)
 		return nil, status.Error(codes.Internal, "internal error")
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(in.Password)); err != nil {
-		return nil, status.Error(codes.PermissionDenied, "email or password is incorrect")
+	if !user.IsActive {
+		return nil, status.Error(codes.PermissionDenied, "account id, email or password is incorrect")
 	}
 
-	token, err := s.jwtService.NewToken(user, time.Hour*2)
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(in.Password)); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "account id, email or password is incorrect")
+	}
+
+	token, expiresAt, err := s.jwtService.NewAccessToken(
+		user,
+		accessTokenTTL,
+		[]string{defaultAudience},
+	)
 	if err != nil {
+		log.Printf("failed to create access token: %v", err)
 		return nil, status.Error(codes.Internal, "internal error")
 	}
 
-	return &pb.LoginResponse{Token: token}, nil
+	return &pb.LoginResponse{
+		Token:     token,
+		ExpiresAt: expiresAt.Format(time.RFC3339),
+	}, nil
 }
 
 func (s *AuthServer) Authenticate(ctx context.Context, in *pb.AuthenticateRequest) (*pb.AuthenticateResponse, error) {
-	token, err := s.jwtService.Validate(in.Token)
+	token := strings.TrimSpace(in.Token)
+	if token == "" {
+		return nil, status.Error(codes.InvalidArgument, "token is required")
+	}
+
+	audience := strings.TrimSpace(in.Audience)
+	if audience == "" {
+		audience = defaultAudience
+	}
+
+	claims, err := s.jwtService.ValidateAccessToken(token, audience)
 	if err != nil {
 		return nil, status.Error(codes.PermissionDenied, "token is expired or invalid")
 	}
 
-	if claims, ok := token.Claims.(j.MapClaims); ok && token.Valid {
-		// jwt numeric representation is always float64
-		if userID, ok := claims["userID"].(float64); ok {
-			return &pb.AuthenticateResponse{
-				UserID: int64(userID),
-			}, nil
-		}
-	}
-
-	return nil, status.Error(codes.Internal, "failed to extract user ID from token")
+	return &pb.AuthenticateResponse{
+		UserId:      claims.Subject,
+		AccountId:   claims.AccountID,
+		Email:       claims.Email,
+		FullName:    claims.FullName,
+		Role:        claims.Role,
+		Permissions: claims.Permissions,
+	}, nil
 }

@@ -1,4 +1,4 @@
-module github.com/trunov/goph-keeper/server/auth
+module github.com/trunov/breitl/backend/server/auth
 
 go 1.21.2
 
@@ -12,6 +12,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/jackc/chunkreader/v2 v2.0.1 // indirect
 	github.com/jackc/pgconn v1.14.0 // indirect
 	github.com/jackc/pgio v1.0.0 // indirect
