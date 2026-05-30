@@ -1,19 +1,13 @@
 package config
 
-import "flag"
+import "os"
 
 type Config struct {
 	PostgresDSN string
 }
 
 func ReadConfig() Config {
-	postgresDSN := flag.String("d", "", "Postgres DSN")
-
-	flag.Parse()
-
-	cfg := Config{
-		PostgresDSN: *postgresDSN,
+	return Config{
+		PostgresDSN: os.Getenv("POSTGRES_DSN"),
 	}
-
-	return cfg
 }
